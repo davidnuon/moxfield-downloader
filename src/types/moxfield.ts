@@ -53,6 +53,12 @@ export const MoxfieldDeckSummarySchema = z.object({
   isUnlisted: z.boolean().optional(),
   lastUpdatedAtUtc: z.string(),
   createdAtUtc: z.string().optional(),
+  createdByUser: z
+    .object({
+      userName: z.string().optional(),
+      displayName: z.string().optional(),
+    })
+    .optional(),
 }).passthrough();
 
 export type MoxfieldDeckSummary = z.infer<typeof MoxfieldDeckSummarySchema>;

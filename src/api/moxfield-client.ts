@@ -91,13 +91,30 @@ export class MoxfieldClient {
 
       const { data, totalPages: pages, totalResults } = parsed.data;
       totalPages = pages;
-      allSummaries.push(...data);
+
+      // Guard: Moxfield silently ignores unknown/non-existent usernames in search,
+      // falling back to returning all public decks across the entire site.
+      const matchingData = data.filter((d) => {
+        const author = d.createdByUser?.userName;
+        return author && author.toLowerCase() === username.toLowerCase();
+      });
+
+      if (data.length > 0 && matchingData.length === 0 && page === 1) {
+        if (this.verbose) {
+          console.warn(
+            `[MoxfieldClient] Author filter was ignored by Moxfield for "${username}". User may not exist or has no public decks.`
+          );
+        }
+        break;
+      }
+
+      allSummaries.push(...matchingData);
 
       if (onPage) {
         onPage(page, totalPages, allSummaries.length);
       }
 
-      if (data.length === 0 || allSummaries.length >= totalResults) {
+      if (data.length === 0 || matchingData.length === 0 || allSummaries.length >= totalResults) {
         break;
       }
 
