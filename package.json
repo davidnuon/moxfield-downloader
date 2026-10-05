@@ -9,7 +9,8 @@
     "moxfield-downloader": "./bin/moxfield-downloader"
   },
   "scripts": {
-    "build": "tsc",
+    "build": "tsc && bun build src/cli-entry.ts --outfile dist/moxfield-downloader.mjs --target node",
+    "bundle": "bun build src/cli-entry.ts --outfile dist/moxfield-downloader.mjs --target node",
     "watch": "tsc --watch",
     "test": "vitest run",
     "test:watch": "vitest",

@@ -11,4 +11,6 @@ export * from './exporters/text-exporter.js';
 export * from './exporters/mtgo-exporter.js';
 export * from './sync/manifest-manager.js';
 export * from './sync/downloader.js';
+export * from './types/history.js';
+export * from './history/git-history-builder.js';
 export { createProgram } from './cli.js';

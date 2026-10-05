@@ -1,6 +1,7 @@
 import { Command } from 'commander';
 import path from 'node:path';
 import { MoxfieldDownloader } from './sync/downloader.js';
+import { GitHistoryBuilder } from './history/git-history-builder.js';
 import { DownloaderOptions, ExportFormat, GroupByStrategy } from './types/options.js';
 
 function parseFormats(formatStr: string): ExportFormat[] {
@@ -134,6 +135,64 @@ export function createProgram(): Command {
       } catch (err: any) {
         console.error(`\n🚨 Fatal Error: ${err.message}`);
         if (options.verbose && err.stack) {
+          console.error(err.stack);
+        }
+        process.exit(1);
+      }
+    });
+
+  program
+    .command('git-history')
+    .description('Generate daily git commits representing the edit history across all decks')
+    .argument('<username>', 'Moxfield username')
+    .option('-d, --dir <dir>', 'Target git repository directory with downloaded decks', '.')
+    .option('-b, --branch <branch>', 'Branch to write historical commits to', 'history')
+    .option('--orphan', 'Create branch as an orphan branch (clean chronological root)', true)
+    .option('--no-orphan', 'Append to existing branch history without creating an orphan root')
+    .option('--author-name <name>', 'Author name for git commits')
+    .option('--author-email <email>', 'Author email for git commits')
+    .option('--dry-run', 'Preview daily commits without creating git commits', false)
+    .option('-v, --verbose', 'Enable verbose logging', false)
+    .action(async (username: string, rawOptions: any) => {
+      const repoDir = path.resolve(process.cwd(), rawOptions.dir);
+      const builder = new GitHistoryBuilder({
+        username,
+        repoDir,
+        branch: rawOptions.branch,
+        orphan: rawOptions.orphan,
+        authorName: rawOptions.authorName,
+        authorEmail: rawOptions.authorEmail,
+        dryRun: Boolean(rawOptions.dryRun),
+        verbose: Boolean(rawOptions.verbose),
+      });
+
+      console.log('====================================================');
+      console.log('      📜 Moxfield Git History Generator             ');
+      console.log('====================================================');
+      console.log(`User:          ${username}`);
+      console.log(`Repository:    ${repoDir}`);
+      console.log(`Target Branch: ${rawOptions.branch}`);
+      console.log(`Mode:          ${rawOptions.dryRun ? 'DRY-RUN' : 'LIVE'}`);
+      console.log('----------------------------------------------------');
+
+      try {
+        const result = await builder.run(
+          (msg) => console.log(`ℹ️  ${msg}`),
+          (current, total, deck) => {
+            console.log(`[${current}/${total}] ⏳ Fetching history: "${deck}"`);
+          }
+        );
+
+        console.log('====================================================');
+        console.log('                   Summary                          ');
+        console.log('====================================================');
+        console.log(`Total Events:    ${result.totalEvents}`);
+        console.log(`Total Days:      ${result.totalDays}`);
+        console.log(`Commits Created: ${result.commitsCreated}`);
+        console.log('====================================================');
+      } catch (err: any) {
+        console.error(`\n🚨 Fatal Error: ${err.message}`);
+        if (rawOptions.verbose && err.stack) {
           console.error(err.stack);
         }
         process.exit(1);

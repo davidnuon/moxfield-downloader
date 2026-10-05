@@ -8,6 +8,10 @@ import {
   MoxfieldUser,
   MoxfieldUserSchema,
 } from '../types/moxfield.js';
+import {
+  MoxfieldHistoryItem,
+  MoxfieldHistoryResponseSchema,
+} from '../types/history.js';
 
 export interface MoxfieldClientConfig {
   baseUrl?: string;
@@ -185,5 +189,68 @@ export class MoxfieldClient {
     }
 
     return parsed.data;
+  }
+
+  /**
+   * Fetches all change history events for a given deck.
+   * Handles pagination automatically.
+   */
+  async getDeckHistory(
+    publicId: string,
+    onPage?: (page: number, totalPages: number) => void
+  ): Promise<MoxfieldHistoryItem[]> {
+    const allHistory: MoxfieldHistoryItem[] = [];
+    let page = 1;
+    let totalPages = 1;
+    const pageSize = 50;
+
+    do {
+      const url = new URL(
+        `/v2/decks/all/${encodeURIComponent(publicId)}/history`,
+        this.baseUrl
+      );
+      url.searchParams.set('pageNumber', page.toString());
+      url.searchParams.set('pageSize', pageSize.toString());
+
+      try {
+        const rawJson = await this.rateLimiter.execute(async () => {
+          return await httpGetJson(url.toString(), {
+            headers: this.getHeaders(),
+            verbose: this.verbose,
+          });
+        });
+
+        const parsed = MoxfieldHistoryResponseSchema.safeParse(rawJson);
+        if (!parsed.success) {
+          if (this.verbose) {
+            console.warn(
+              `[MoxfieldClient] History schema validation warning for ${publicId}: ${parsed.error.message}`
+            );
+          }
+          break;
+        }
+
+        const { data, totalPages: pages, totalResults } = parsed.data;
+        totalPages = pages;
+        allHistory.push(...data);
+
+        if (onPage) {
+          onPage(page, totalPages);
+        }
+
+        if (data.length === 0 || allHistory.length >= totalResults) {
+          break;
+        }
+
+        page++;
+      } catch (err: any) {
+        if (err instanceof HttpError && err.status === 404) {
+          break;
+        }
+        throw err;
+      }
+    } while (page <= totalPages);
+
+    return allHistory;
   }
 }

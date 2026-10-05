@@ -1891,7 +1891,7 @@ var {
 } = exports_commander;
 
 // src/cli.ts
-import path3 from "node:path";
+import path4 from "node:path";
 
 // src/sync/downloader.ts
 import { promises as fs2 } from "node:fs";
@@ -5942,6 +5942,22 @@ var MoxfieldDeckSchema = objectType({
   boards: recordType(stringType(), anyType()).optional()
 }).passthrough();
 
+// src/types/history.ts
+var MoxfieldHistoryItemSchema = objectType({
+  boardType: stringType(),
+  card: MoxfieldCardSchema,
+  cardType: stringType().optional(),
+  quantityDelta: numberType(),
+  updatedAtUtc: stringType()
+}).passthrough();
+var MoxfieldHistoryResponseSchema = objectType({
+  pageNumber: numberType(),
+  pageSize: numberType(),
+  totalResults: numberType(),
+  totalPages: numberType(),
+  data: arrayType(MoxfieldHistoryItemSchema)
+}).passthrough();
+
 // src/api/moxfield-client.ts
 class MoxfieldClient {
   baseUrl;
@@ -6063,6 +6079,48 @@ class MoxfieldClient {
       return rawJson;
     }
     return parsed.data;
+  }
+  async getDeckHistory(publicId, onPage) {
+    const allHistory = [];
+    let page = 1;
+    let totalPages = 1;
+    const pageSize = 50;
+    do {
+      const url = new URL(`/v2/decks/all/${encodeURIComponent(publicId)}/history`, this.baseUrl);
+      url.searchParams.set("pageNumber", page.toString());
+      url.searchParams.set("pageSize", pageSize.toString());
+      try {
+        const rawJson = await this.rateLimiter.execute(async () => {
+          return await httpGetJson(url.toString(), {
+            headers: this.getHeaders(),
+            verbose: this.verbose
+          });
+        });
+        const parsed = MoxfieldHistoryResponseSchema.safeParse(rawJson);
+        if (!parsed.success) {
+          if (this.verbose) {
+            console.warn(`[MoxfieldClient] History schema validation warning for ${publicId}: ${parsed.error.message}`);
+          }
+          break;
+        }
+        const { data, totalPages: pages, totalResults } = parsed.data;
+        totalPages = pages;
+        allHistory.push(...data);
+        if (onPage) {
+          onPage(page, totalPages);
+        }
+        if (data.length === 0 || allHistory.length >= totalResults) {
+          break;
+        }
+        page++;
+      } catch (err) {
+        if (err instanceof HttpError && err.status === 404) {
+          break;
+        }
+        throw err;
+      }
+    } while (page <= totalPages);
+    return allHistory;
   }
 }
 
@@ -6401,6 +6459,369 @@ class MoxfieldDownloader {
   }
 }
 
+// src/history/git-history-builder.ts
+import { execFile as execFile2 } from "node:child_process";
+import { promises as fs3 } from "node:fs";
+import path3 from "node:path";
+import { promisify as promisify2 } from "node:util";
+var exec2 = promisify2(execFile2);
+function extractCardsMap(rawBoard) {
+  if (!rawBoard)
+    return {};
+  if (rawBoard.cards && typeof rawBoard.cards === "object") {
+    return JSON.parse(JSON.stringify(rawBoard.cards));
+  }
+  if (typeof rawBoard === "object") {
+    return JSON.parse(JSON.stringify(rawBoard));
+  }
+  return {};
+}
+function cloneDeckBoards(deck) {
+  return {
+    commanders: extractCardsMap(deck.commanders ?? deck.boards?.commanders),
+    mainboard: extractCardsMap(deck.mainboard ?? deck.boards?.mainboard),
+    sideboard: extractCardsMap(deck.sideboard ?? deck.boards?.sideboard),
+    companions: extractCardsMap(deck.companions ?? deck.boards?.companions),
+    maybeboard: extractCardsMap(deck.maybeboard ?? deck.considering ?? deck.boards?.maybeboard ?? deck.boards?.considering),
+    signatureSpells: extractCardsMap(deck.signatureSpells ?? deck.boards?.signatureSpells),
+    attractions: extractCardsMap(deck.attractions ?? deck.boards?.attractions),
+    stickers: extractCardsMap(deck.stickers ?? deck.boards?.stickers),
+    tokens: extractCardsMap(deck.tokens ?? deck.boards?.tokens)
+  };
+}
+function resolveBoardName(boardType, boards) {
+  if (boardType === "partners")
+    return "commanders";
+  if (boardType === "considering")
+    return "maybeboard";
+  if (boardType in boards)
+    return boardType;
+  return "mainboard";
+}
+function assembleDeckFromBoards(base, boards) {
+  return {
+    ...base,
+    commanders: JSON.parse(JSON.stringify(boards.commanders)),
+    mainboard: JSON.parse(JSON.stringify(boards.mainboard)),
+    sideboard: JSON.parse(JSON.stringify(boards.sideboard)),
+    companions: JSON.parse(JSON.stringify(boards.companions)),
+    maybeboard: JSON.parse(JSON.stringify(boards.maybeboard)),
+    signatureSpells: JSON.parse(JSON.stringify(boards.signatureSpells)),
+    attractions: JSON.parse(JSON.stringify(boards.attractions)),
+    stickers: JSON.parse(JSON.stringify(boards.stickers)),
+    tokens: JSON.parse(JSON.stringify(boards.tokens))
+  };
+}
+
+class GitHistoryBuilder {
+  client;
+  options;
+  constructor(options) {
+    this.options = options;
+    this.client = new MoxfieldClient({
+      concurrency: options.concurrency ?? 2,
+      delayMs: options.delayMs ?? 350,
+      verbose: options.verbose ?? false
+    });
+  }
+  async run(onMessage, onProgress) {
+    const { repoDir, username, dryRun, branch = "history", orphan = true } = this.options;
+    const authorName = this.options.authorName || username;
+    const authorEmail = this.options.authorEmail || `${username}@users.noreply.moxfield.com`;
+    onMessage?.(`Scanning existing downloaded decks in ${repoDir}...`);
+    const deckRecords = await this.discoverDecks(repoDir);
+    onMessage?.(`Found ${deckRecords.length} deck(s) on disk. Fetching edit histories...`);
+    let totalEvents = 0;
+    const cacheFilePath = path3.join(repoDir, ".moxfield-history-cache.json");
+    let historyCache = {};
+    try {
+      const cacheContent = await fs3.readFile(cacheFilePath, "utf8");
+      historyCache = JSON.parse(cacheContent);
+    } catch {}
+    for (let i = 0;i < deckRecords.length; i++) {
+      const record = deckRecords[i];
+      const publicId = record.currentDeck.publicId || record.currentDeck.id;
+      onProgress?.(i + 1, deckRecords.length, record.currentDeck.name);
+      let historyItems;
+      if (historyCache[publicId]) {
+        historyItems = historyCache[publicId];
+      } else {
+        historyItems = await this.client.getDeckHistory(publicId);
+        historyCache[publicId] = historyItems;
+      }
+      for (const item of historyItems) {
+        const dateStr = item.updatedAtUtc.slice(0, 10);
+        record.events.push({
+          deckId: record.currentDeck.id,
+          deckName: record.currentDeck.name,
+          publicId,
+          format: record.currentDeck.format,
+          boardType: item.boardType,
+          card: item.card,
+          quantityDelta: item.quantityDelta,
+          timestamp: item.updatedAtUtc,
+          dateStr
+        });
+        totalEvents++;
+      }
+      const earliestEvent = record.events.length > 0 ? record.events.reduce((min, e) => e.dateStr < min ? e.dateStr : min, record.events[0].dateStr) : undefined;
+      const createdDate = record.currentDeck.createdAtUtc ? record.currentDeck.createdAtUtc.slice(0, 10) : undefined;
+      record.birthDay = [createdDate, earliestEvent].filter((d) => Boolean(d)).sort()[0] || "2020-01-01";
+    }
+    try {
+      await fs3.writeFile(cacheFilePath, JSON.stringify(historyCache, null, 2), "utf8");
+    } catch {}
+    onMessage?.(`Collected ${totalEvents} edit event(s) across all decks.`);
+    const dayMap = new Map;
+    const allDaysSet = new Set;
+    for (const record of deckRecords) {
+      allDaysSet.add(record.birthDay);
+      for (const ev of record.events) {
+        let list = dayMap.get(ev.dateStr);
+        if (!list) {
+          list = [];
+          dayMap.set(ev.dateStr, list);
+        }
+        list.push(ev);
+        allDaysSet.add(ev.dateStr);
+      }
+    }
+    const sortedDays = Array.from(allDaysSet).sort();
+    onMessage?.(`Timeline spans ${sortedDays.length} active day(s).`);
+    if (sortedDays.length === 0) {
+      onMessage?.(`No edit history found to reconstruct.`);
+      return { totalEvents: 0, totalDays: 0, commitsCreated: 0 };
+    }
+    onMessage?.(`Computing historical deck states via reverse deltas...`);
+    for (const record of deckRecords) {
+      const reverseEvents = [...record.events].sort((a, b) => new Date(b.timestamp).getTime() - new Date(a.timestamp).getTime());
+      const reverseDaysMap = new Map;
+      for (const ev of reverseEvents) {
+        let list = reverseDaysMap.get(ev.dateStr);
+        if (!list) {
+          list = [];
+          reverseDaysMap.set(ev.dateStr, list);
+        }
+        list.push(ev);
+      }
+      const deckDaysReverse = Array.from(reverseDaysMap.keys()).sort().reverse();
+      const boards = cloneDeckBoards(record.currentDeck);
+      for (const day of deckDaysReverse) {
+        record.dailySnapshots.set(day, assembleDeckFromBoards(record.currentDeck, boards));
+        const dayEvs = reverseDaysMap.get(day) || [];
+        for (const ev of dayEvs) {
+          const boardName = resolveBoardName(ev.boardType, boards);
+          const cardName = ev.card.name;
+          const currentEntry = boards[boardName]?.[cardName];
+          const currentQty = currentEntry?.quantity || 0;
+          const reversedQty = currentQty - ev.quantityDelta;
+          if (reversedQty <= 0) {
+            delete boards[boardName][cardName];
+          } else {
+            boards[boardName][cardName] = {
+              quantity: reversedQty,
+              card: ev.card
+            };
+          }
+        }
+      }
+      record.initialDeck = assembleDeckFromBoards(record.currentDeck, boards);
+    }
+    if (dryRun) {
+      onMessage?.(`[DRY-RUN] Simulating daily commit log:`);
+      for (const day of sortedDays) {
+        const events = dayMap.get(day) || [];
+        const decksBorn = deckRecords.filter((r) => r.birthDay === day).length;
+        const deckCount = new Set(events.map((e) => e.deckId)).size;
+        onMessage?.(`  \uD83D\uDCC5 ${day}: ${events.length} card change(s) across ${deckCount} deck(s)` + (decksBorn > 0 ? ` [${decksBorn} deck(s) created]` : ""));
+      }
+      return { totalEvents, totalDays: sortedDays.length, commitsCreated: 0 };
+    }
+    onMessage?.(`Preparing branch "${branch}" in ${repoDir}...`);
+    try {
+      const gitDir = path3.join(repoDir, ".git");
+      const excludePath = path3.join(gitDir, "info", "exclude");
+      let excludeContent = "";
+      try {
+        excludeContent = await fs3.readFile(excludePath, "utf8");
+      } catch {}
+      if (!excludeContent.includes(".moxfield-history-cache.json")) {
+        await fs3.mkdir(path3.dirname(excludePath), { recursive: true });
+        await fs3.appendFile(excludePath, `
+.moxfield-history-cache.json
+*.moxfield-history*.json
+`, "utf8");
+      }
+    } catch {}
+    if (orphan) {
+      try {
+        const { stdout } = await exec2("git", ["branch", "--show-current"], { cwd: repoDir });
+        if (stdout.trim() === branch) {
+          await exec2("git", ["checkout", "--detach", "HEAD"], { cwd: repoDir });
+        }
+      } catch {}
+      try {
+        await exec2("git", ["branch", "-D", branch], { cwd: repoDir });
+      } catch {}
+      await exec2("git", ["checkout", "--orphan", branch], { cwd: repoDir });
+      try {
+        await exec2("git", ["rm", "--cached", "-r", "."], { cwd: repoDir });
+      } catch {}
+      for (const record of deckRecords) {
+        try {
+          await fs3.rm(record.deckDir, { recursive: true, force: true });
+        } catch {}
+      }
+      const earliestDay = sortedDays[0];
+      const baselineDate = new Date(new Date(earliestDay).getTime() - 86400000).toISOString().slice(0, 10);
+      await exec2("git", ["add", "."], { cwd: repoDir });
+      const baselineEnv = {
+        ...process.env,
+        GIT_AUTHOR_NAME: authorName,
+        GIT_AUTHOR_EMAIL: authorEmail,
+        GIT_AUTHOR_DATE: `${baselineDate} 12:00:00 +0000`,
+        GIT_COMMITTER_NAME: authorName,
+        GIT_COMMITTER_EMAIL: authorEmail,
+        GIT_COMMITTER_DATE: `${baselineDate} 12:00:00 +0000`
+      };
+      try {
+        await exec2("git", ["commit", "-m", "chore: initialize moxfield repository structure"], {
+          cwd: repoDir,
+          env: baselineEnv
+        });
+      } catch {}
+    } else {
+      await exec2("git", ["checkout", "-B", branch], { cwd: repoDir });
+    }
+    let commitsCount = orphan ? 1 : 0;
+    for (let dayIndex = 0;dayIndex < sortedDays.length; dayIndex++) {
+      const day = sortedDays[dayIndex];
+      const dayEvents = dayMap.get(day) || [];
+      const decksBornToday = deckRecords.filter((r) => r.birthDay === day);
+      const decksEditedToday = deckRecords.filter((r) => {
+        const evs = dayEvents.filter((e) => e.deckId === r.currentDeck.id);
+        return evs.length > 0;
+      });
+      const touchedDecks = new Set([...decksBornToday, ...decksEditedToday]);
+      if (touchedDecks.size === 0)
+        continue;
+      for (const record of touchedDecks) {
+        const snapshot = record.dailySnapshots.get(day) ?? record.initialDeck;
+        await this.writeDeckFiles(record.deckDir, snapshot);
+      }
+      await exec2("git", ["add", "."], { cwd: repoDir });
+      const touchedList = Array.from(touchedDecks);
+      const commitTitle = touchedList.length === 1 ? `feat(${touchedList[0].currentDeck.name}): deck updates on ${day}` : `chore: deck updates across ${touchedList.length} decks on ${day}`;
+      const bodyLines = [];
+      for (const record of touchedList) {
+        const evs = dayEvents.filter((e) => e.deckId === record.currentDeck.id);
+        const isBorn = record.birthDay === day;
+        bodyLines.push(`${record.currentDeck.name} [${record.currentDeck.id}]:`);
+        if (isBorn && evs.length === 0) {
+          bodyLines.push(`  * Created deck "${record.currentDeck.name}" (${record.currentDeck.format})`);
+        } else {
+          for (const ev of evs) {
+            const sign = ev.quantityDelta > 0 ? `+ ${ev.quantityDelta}` : `- ${Math.abs(ev.quantityDelta)}`;
+            bodyLines.push(`  ${sign} ${ev.card.name} (${ev.boardType})`);
+          }
+        }
+        bodyLines.push("");
+      }
+      const commitMessage = `${commitTitle}
+
+${bodyLines.join(`
+`).trimEnd()}`;
+      const commitDate = `${day} 12:00:00 +0000`;
+      const env = {
+        ...process.env,
+        GIT_AUTHOR_NAME: authorName,
+        GIT_AUTHOR_EMAIL: authorEmail,
+        GIT_AUTHOR_DATE: commitDate,
+        GIT_COMMITTER_NAME: authorName,
+        GIT_COMMITTER_EMAIL: authorEmail,
+        GIT_COMMITTER_DATE: commitDate
+      };
+      try {
+        await exec2("git", ["commit", "-m", commitMessage], {
+          cwd: repoDir,
+          env
+        });
+        commitsCount++;
+        onMessage?.(`[${dayIndex + 1}/${sortedDays.length}] ✅ Committed edits for ${day}`);
+      } catch (err) {
+        if (!err.message.includes("nothing to commit")) {
+          throw err;
+        }
+      }
+    }
+    for (const record of deckRecords) {
+      await this.writeDeckFiles(record.deckDir, record.currentDeck);
+    }
+    await exec2("git", ["add", "."], { cwd: repoDir });
+    try {
+      const envLatest = {
+        ...process.env,
+        GIT_AUTHOR_NAME: authorName,
+        GIT_AUTHOR_EMAIL: authorEmail,
+        GIT_AUTHOR_DATE: `${new Date().toISOString().slice(0, 10)} 12:00:00 +0000`,
+        GIT_COMMITTER_NAME: authorName,
+        GIT_COMMITTER_EMAIL: authorEmail,
+        GIT_COMMITTER_DATE: `${new Date().toISOString().slice(0, 10)} 12:00:00 +0000`
+      };
+      await exec2("git", ["commit", "-m", `chore: synchronize latest deck state with Moxfield`], {
+        cwd: repoDir,
+        env: envLatest
+      });
+      commitsCount++;
+    } catch {}
+    onMessage?.(`Successfully created ${commitsCount} historical commit(s) on branch "${branch}".`);
+    return { totalEvents, totalDays: sortedDays.length, commitsCreated: commitsCount };
+  }
+  async writeDeckFiles(deckDir, deck) {
+    await fs3.mkdir(deckDir, { recursive: true });
+    const jsonPath = path3.join(deckDir, "deck.json");
+    const txtPath = path3.join(deckDir, "deck.txt");
+    await fs3.writeFile(jsonPath, exportToJson(deck), "utf8");
+    await fs3.writeFile(txtPath, exportToText(deck, { includeConsidering: true }), "utf8");
+  }
+  async discoverDecks(repoDir) {
+    const records = [];
+    const entries = await fs3.readdir(repoDir, { withFileTypes: true });
+    for (const entry of entries) {
+      if (!entry.isDirectory() || entry.name.startsWith("."))
+        continue;
+      const formatDir = path3.join(repoDir, entry.name);
+      let subEntries;
+      try {
+        subEntries = await fs3.readdir(formatDir, { withFileTypes: true });
+      } catch {
+        continue;
+      }
+      for (const sub of subEntries) {
+        if (!sub.isDirectory() || sub.name.startsWith("."))
+          continue;
+        const deckDir = path3.join(formatDir, sub.name);
+        const jsonPath = path3.join(deckDir, "deck.json");
+        try {
+          const content = await fs3.readFile(jsonPath, "utf8");
+          const currentDeck = JSON.parse(content);
+          records.push({
+            deckDir,
+            formatDirName: entry.name,
+            deckFolder: sub.name,
+            currentDeck,
+            events: [],
+            initialDeck: currentDeck,
+            dailySnapshots: new Map,
+            birthDay: "2020-01-01"
+          });
+        } catch {}
+      }
+    }
+    return records;
+  }
+}
+
 // src/cli.ts
 function parseFormats(formatStr) {
   const allowed = ["json", "text", "arena", "mtgo"];
@@ -6421,7 +6842,7 @@ function createProgram() {
   const program = new Command2;
   program.name("moxfield-downloader").description("CLI tool to download and archive all decks from a Moxfield user account").version("0.1.0");
   program.command("download").description("Download all decks for a specified Moxfield username").argument("<username>", "Moxfield username").option("-o, --output <dir>", "Destination directory for decks", "./decks").option("-f, --format <formats>", "Comma-separated export formats (json, text, arena, mtgo)", "text,json").option("--group-by <strategy>", 'Folder grouping strategy: "format" or "none"', "format").option("--flat", "Output files directly without creating subdirectories per deck", false).option("--no-considering", "Exclude considering / maybeboard cards").option("--no-incremental", "Re-download all decks, ignoring the sync manifest").option("--concurrency <n>", "Maximum parallel HTTP requests (default: 2)", "2").option("--delay <ms>", "Delay between sequential requests in milliseconds", "350").option("--token <token>", "Optional Moxfield session/Bearer token for private decks").option("--dry-run", "Preview decks to download without saving files", false).option("-v, --verbose", "Enable verbose logging", false).action(async (username, rawOptions) => {
-    const outputDir = path3.resolve(process.cwd(), rawOptions.output);
+    const outputDir = path4.resolve(process.cwd(), rawOptions.output);
     const formats = parseFormats(rawOptions.format);
     const concurrency = Math.max(1, parseInt(rawOptions.concurrency, 10) || 2);
     const delayMs = Math.max(0, parseInt(rawOptions.delay, 10) || 350);
@@ -6496,6 +6917,46 @@ function createProgram() {
       console.error(`
 \uD83D\uDEA8 Fatal Error: ${err.message}`);
       if (options.verbose && err.stack) {
+        console.error(err.stack);
+      }
+      process.exit(1);
+    }
+  });
+  program.command("git-history").description("Generate daily git commits representing the edit history across all decks").argument("<username>", "Moxfield username").option("-d, --dir <dir>", "Target git repository directory with downloaded decks", ".").option("-b, --branch <branch>", "Branch to write historical commits to", "history").option("--orphan", "Create branch as an orphan branch (clean chronological root)", true).option("--no-orphan", "Append to existing branch history without creating an orphan root").option("--author-name <name>", "Author name for git commits").option("--author-email <email>", "Author email for git commits").option("--dry-run", "Preview daily commits without creating git commits", false).option("-v, --verbose", "Enable verbose logging", false).action(async (username, rawOptions) => {
+    const repoDir = path4.resolve(process.cwd(), rawOptions.dir);
+    const builder = new GitHistoryBuilder({
+      username,
+      repoDir,
+      branch: rawOptions.branch,
+      orphan: rawOptions.orphan,
+      authorName: rawOptions.authorName,
+      authorEmail: rawOptions.authorEmail,
+      dryRun: Boolean(rawOptions.dryRun),
+      verbose: Boolean(rawOptions.verbose)
+    });
+    console.log("====================================================");
+    console.log("      \uD83D\uDCDC Moxfield Git History Generator             ");
+    console.log("====================================================");
+    console.log(`User:          ${username}`);
+    console.log(`Repository:    ${repoDir}`);
+    console.log(`Target Branch: ${rawOptions.branch}`);
+    console.log(`Mode:          ${rawOptions.dryRun ? "DRY-RUN" : "LIVE"}`);
+    console.log("----------------------------------------------------");
+    try {
+      const result = await builder.run((msg) => console.log(`ℹ️  ${msg}`), (current, total, deck) => {
+        console.log(`[${current}/${total}] ⏳ Fetching history: "${deck}"`);
+      });
+      console.log("====================================================");
+      console.log("                   Summary                          ");
+      console.log("====================================================");
+      console.log(`Total Events:    ${result.totalEvents}`);
+      console.log(`Total Days:      ${result.totalDays}`);
+      console.log(`Commits Created: ${result.commitsCreated}`);
+      console.log("====================================================");
+    } catch (err) {
+      console.error(`
+\uD83D\uDEA8 Fatal Error: ${err.message}`);
+      if (rawOptions.verbose && err.stack) {
         console.error(err.stack);
       }
       process.exit(1);
