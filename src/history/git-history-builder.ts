@@ -293,6 +293,8 @@ export class GitHistoryBuilder {
       // ignore
     }
 
+    let commitsCount = 0;
+
     if (orphan) {
       try {
         const { stdout } = await exec('git', ['branch', '--show-current'], { cwd: repoDir });
@@ -343,19 +345,24 @@ export class GitHistoryBuilder {
         GIT_COMMITTER_DATE: `${baselineDate} 12:00:00 +0000`,
       };
 
-      try {
-        await exec('git', ['commit', '-m', 'chore: initialize moxfield repository structure'], {
-          cwd: repoDir,
-          env: baselineEnv,
-        });
-      } catch {
-        // nothing to commit
+      const { stdout: baselineStatus } = await exec('git', ['status', '--porcelain'], { cwd: repoDir });
+      if (baselineStatus.trim()) {
+        try {
+          await exec('git', ['commit', '-m', 'chore: initialize moxfield repository structure'], {
+            cwd: repoDir,
+            env: baselineEnv,
+          });
+          commitsCount++;
+        } catch (err: any) {
+          const allOutput = `${err.message || ''} ${err.stdout || ''} ${err.stderr || ''}`;
+          if (!allOutput.includes('nothing to commit')) {
+            throw err;
+          }
+        }
       }
     } else {
       await exec('git', ['checkout', '-B', branch], { cwd: repoDir });
     }
-
-    let commitsCount = orphan ? 1 : 0;
 
     // Step B: Forward Replay for each calendar day
     for (let dayIndex = 0; dayIndex < sortedDays.length; dayIndex++) {
@@ -379,6 +386,11 @@ export class GitHistoryBuilder {
       }
 
       await exec('git', ['add', '.'], { cwd: repoDir });
+
+      const { stdout: status } = await exec('git', ['status', '--porcelain'], { cwd: repoDir });
+      if (!status.trim()) {
+        continue;
+      }
 
       // Generate informative commit message
       const touchedList = Array.from(touchedDecks);
@@ -426,7 +438,8 @@ export class GitHistoryBuilder {
         commitsCount++;
         onMessage?.(`[${dayIndex + 1}/${sortedDays.length}] ✅ Committed edits for ${day}`);
       } catch (err: any) {
-        if (!err.message.includes('nothing to commit')) {
+        const allOutput = `${err.message || ''} ${err.stdout || ''} ${err.stderr || ''}`;
+        if (!allOutput.includes('nothing to commit')) {
           throw err;
         }
       }
@@ -437,23 +450,30 @@ export class GitHistoryBuilder {
       await this.writeDeckFiles(record.deckDir, record.currentDeck);
     }
     await exec('git', ['add', '.'], { cwd: repoDir });
-    try {
-      const envLatest = {
-        ...process.env,
-        GIT_AUTHOR_NAME: authorName,
-        GIT_AUTHOR_EMAIL: authorEmail,
-        GIT_AUTHOR_DATE: `${new Date().toISOString().slice(0, 10)} 12:00:00 +0000`,
-        GIT_COMMITTER_NAME: authorName,
-        GIT_COMMITTER_EMAIL: authorEmail,
-        GIT_COMMITTER_DATE: `${new Date().toISOString().slice(0, 10)} 12:00:00 +0000`,
-      };
-      await exec('git', ['commit', '-m', `chore: synchronize latest deck state with Moxfield`], {
-        cwd: repoDir,
-        env: envLatest,
-      });
-      commitsCount++;
-    } catch {
-      // exact match with last commit, nothing to commit
+
+    const { stdout: finalStatus } = await exec('git', ['status', '--porcelain'], { cwd: repoDir });
+    if (finalStatus.trim()) {
+      try {
+        const envLatest = {
+          ...process.env,
+          GIT_AUTHOR_NAME: authorName,
+          GIT_AUTHOR_EMAIL: authorEmail,
+          GIT_AUTHOR_DATE: `${new Date().toISOString().slice(0, 10)} 12:00:00 +0000`,
+          GIT_COMMITTER_NAME: authorName,
+          GIT_COMMITTER_EMAIL: authorEmail,
+          GIT_COMMITTER_DATE: `${new Date().toISOString().slice(0, 10)} 12:00:00 +0000`,
+        };
+        await exec('git', ['commit', '-m', `chore: synchronize latest deck state with Moxfield`], {
+          cwd: repoDir,
+          env: envLatest,
+        });
+        commitsCount++;
+      } catch (err: any) {
+        const allOutput = `${err.message || ''} ${err.stdout || ''} ${err.stderr || ''}`;
+        if (!allOutput.includes('nothing to commit')) {
+          throw err;
+        }
+      }
     }
 
     onMessage?.(`Successfully created ${commitsCount} historical commit(s) on branch "${branch}".`);
