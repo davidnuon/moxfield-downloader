@@ -12,6 +12,24 @@
         pkgs = import nixpkgs { inherit system; };
       in
       {
+        packages.default = pkgs.stdenv.mkDerivation {
+          pname = "moxfield-downloader";
+          version = "0.1.0";
+          src = ./.;
+
+          nativeBuildInputs = [ pkgs.makeWrapper ];
+
+          dontBuild = true;
+
+          installPhase = ''
+            mkdir -p $out/bin $out/lib
+            cp dist/moxfield-downloader.mjs $out/lib/
+            makeWrapper ${pkgs.nodejs_22}/bin/node $out/bin/moxfield-downloader \
+              --add-flags "$out/lib/moxfield-downloader.mjs" \
+              --prefix PATH : ${pkgs.lib.makeBinPath [ pkgs.curl pkgs.nodejs_22 ]}
+          '';
+        };
+
         devShells.default = pkgs.mkShell {
           name = "nodejs-dev-shell";
 
