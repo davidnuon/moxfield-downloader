@@ -1,0 +1,38 @@
+{
+  "name": "moxfield-downloader",
+  "version": "0.1.0",
+  "description": "CLI tool to download and archive all Magic: The Gathering decks from a Moxfield account",
+  "type": "module",
+  "main": "dist/index.js",
+  "types": "dist/index.d.ts",
+  "bin": {
+    "moxfield-downloader": "./bin/moxfield-downloader"
+  },
+  "scripts": {
+    "build": "tsc",
+    "watch": "tsc --watch",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "format": "biome format --write .",
+    "lint": "biome check .",
+    "start": "node ./bin/moxfield-downloader.js"
+  },
+  "keywords": [
+    "moxfield",
+    "mtg",
+    "magic-the-gathering",
+    "deck-downloader",
+    "cli"
+  ],
+  "author": "David Nuon",
+  "license": "MIT",
+  "dependencies": {
+    "commander": "^12.1.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@types/node": "^22.5.5",
+    "typescript": "^5.6.2",
+    "vitest": "^2.1.1"
+  }
+}
