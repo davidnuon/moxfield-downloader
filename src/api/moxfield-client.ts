@@ -1,10 +1,12 @@
 import { RateLimiter } from '../utils/rate-limiter.js';
-import { httpGetJson } from '../utils/http.js';
+import { HttpError, httpGetJson } from '../utils/http.js';
 import {
   MoxfieldDeck,
   MoxfieldDeckSchema,
   MoxfieldDeckSummary,
   MoxfieldSearchResponseSchema,
+  MoxfieldUser,
+  MoxfieldUserSchema,
 } from '../types/moxfield.js';
 
 export interface MoxfieldClientConfig {
@@ -50,6 +52,29 @@ export class MoxfieldClient {
   }
 
   /**
+   * Fetch a user profile by username.
+   * Returns null if the user does not exist (HTTP 404).
+   */
+  async getUser(username: string): Promise<MoxfieldUser | null> {
+    const url = new URL(`/v1/users/${encodeURIComponent(username)}`, this.baseUrl);
+    try {
+      const rawJson = await this.rateLimiter.execute(async () => {
+        return await httpGetJson(url.toString(), {
+          headers: this.getHeaders(),
+          verbose: this.verbose,
+        });
+      });
+      const parsed = MoxfieldUserSchema.safeParse(rawJson);
+      return parsed.success ? parsed.data : (rawJson as MoxfieldUser);
+    } catch (err: any) {
+      if (err instanceof HttpError && err.status === 404) {
+        return null;
+      }
+      throw err;
+    }
+  }
+
+  /**
    * Enumerate all decks created by a specified user.
    * Handles pagination automatically until all decks are retrieved.
    */
@@ -57,6 +82,14 @@ export class MoxfieldClient {
     username: string,
     onPage?: (page: number, totalPages: number, currentCount: number) => void
   ): Promise<MoxfieldDeckSummary[]> {
+    // Stop immediately if user does not exist (HTTP 404)
+    const user = await this.getUser(username);
+    if (!user) {
+      throw new Error(
+        `User "${username}" was not found on Moxfield (HTTP 404). Please verify the username.`
+      );
+    }
+
     const allSummaries: MoxfieldDeckSummary[] = [];
     let page = 1;
     let totalPages = 1;

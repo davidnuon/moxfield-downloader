@@ -4,6 +4,7 @@ export * from './types/options.js';
 export * from './utils/sanitizer.js';
 export * from './utils/rate-limiter.js';
 export * from './utils/retry.js';
+export * from './utils/http.js';
 export * from './api/moxfield-client.js';
 export * from './exporters/json-exporter.js';
 export * from './exporters/text-exporter.js';

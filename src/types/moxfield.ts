@@ -1,5 +1,12 @@
 import { z } from 'zod';
 
+export const MoxfieldUserSchema = z.object({
+  userName: z.string(),
+  deckCount: z.number().optional(),
+}).passthrough();
+
+export type MoxfieldUser = z.infer<typeof MoxfieldUserSchema>;
+
 export const MoxfieldCardSchema = z.object({
   id: z.string(),
   name: z.string(),
